@@ -10,6 +10,10 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#ifdef WITH_CUDA_BUFFERS
+#include <cuda_egl_interop.h>
+#include <cuda_runtime.h>
+#endif
 
 #define CHUNK_SIZE 4000000
 #define MAX_BUFFERS 32
@@ -324,7 +328,12 @@ void nvmpictx::initFramePool()
 	for(int i=0;i<frame_pool_size;i++)
 	{
 		NVMPI_frameBuf* fb = new NVMPI_frameBuf();
-		if(!fb->alloc(input_params)) break;
+		if(!fb->alloc(input_params))
+		{
+			delete fb;
+			break;
+		}
+
 		framePool->qEmptyBuf(fb);
 	}
 	//TODO retun false on allocation failed
@@ -666,6 +675,41 @@ int nvmpi_decoder_put_packet(nvmpictx* ctx,nvPacket* packet)
 
 int copyNvBufToFrame(nvmpictx* ctx, NVMPI_frameBuf *nvmpiBuf, nvFrame* frame)
 {
+#ifdef WITH_CUDA_BUFFERS
+	NvBufSurface *nvbuf_surf = nvmpiBuf->dst_dma_surface;
+	int ret = NvBufSurfaceMap(nvbuf_surf, 0, -1, NVBUF_MAP_READ);
+	if(ret != 0)
+	{
+		printf("NvBufferMap failed \n");
+		NvBufSurfaceUnMap(nvbuf_surf, 0, -1);
+		return ret;
+	}
+
+	NvBufSurfaceSyncForDevice(nvbuf_surf, 0, -1);
+
+	for(unsigned int plane=0; plane<ctx->num_planes; plane++)
+	{
+		// Copy from EGL image to CUDA device memory
+		unsigned char* dataSrc = static_cast<unsigned char *>(nvmpiBuf->egl_frame.frame.pPitch[plane].ptr);
+		void *cudaDst = nvmpiBuf->cuda_ptr[plane];
+		size_t cudaDstPitch = nvmpiBuf->cuda_pitch[plane];
+		unsigned int &srcFrameLineSize = ctx->frame_linesize[plane];
+		unsigned int &copySz = ctx->frame_linedatasize[plane];
+		cudaError_t cudaRet = cudaMemcpy2D(cudaDst, cudaDstPitch, dataSrc, srcFrameLineSize, copySz,
+			ctx->frame_height[plane], cudaMemcpyDeviceToDevice);
+		if(cudaRet != cudaSuccess)
+		{
+			printf("CUDA memcpy failed for plane %d: %s\n", plane, cudaGetErrorString(cudaRet));
+			NvBufSurfaceUnMap(nvbuf_surf, 0, plane);
+			return -1;
+		}
+
+		frame->payload[plane] = static_cast<unsigned char*>(cudaDst);
+		frame->linesize[plane] = cudaDstPitch;
+	}
+
+	NvBufSurfaceUnMap(nvbuf_surf, 0, -1);
+#else
 	int ret;
 	char *dataDst;
 	char *dataSrc;
@@ -708,7 +752,9 @@ int copyNvBufToFrame(nvmpictx* ctx, NVMPI_frameBuf *nvmpiBuf, nvFrame* frame)
 		NvBufferMemUnMap(dmabuf_fd, plane, &psrc_data);
 #endif
 	}
-    return 0;
+#endif
+
+	return 0;
 }
 
 int nvmpi_decoder_get_frame(nvmpictx* ctx,nvFrame* frame,bool wait)

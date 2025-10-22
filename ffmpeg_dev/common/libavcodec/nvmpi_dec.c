@@ -158,18 +158,23 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 		}
 	}
 
-	_nvframe.payload[0] = bufFrame->data[0];
-	_nvframe.payload[1] = bufFrame->data[1];
-	_nvframe.payload[2] = bufFrame->data[2];
-	_nvframe.linesize[0] = bufFrame->linesize[0];
-	_nvframe.linesize[1] = bufFrame->linesize[1];
-	_nvframe.linesize[2] = bufFrame->linesize[2];
+	for (int i = 0; i < 3; ++i)
+	{
+		_nvframe.payload[i] = bufFrame->data[i];
+		_nvframe.linesize[i] = bufFrame->linesize[i];
+	}
 
 	res=nvmpi_decoder_get_frame(nvmpi_context->ctx,&_nvframe,avctx->flags & AV_CODEC_FLAG_LOW_DELAY);
 
 	if(res<0)
 	{
 		return decode_ret;
+	}
+
+	for (int i = 0; i < 3; ++i)
+	{
+		bufFrame->data[i] = _nvframe.payload[i];
+		bufFrame->linesize[i] = _nvframe.linesize[i];
 	}
 
 	bufFrame->format=AV_PIX_FMT_YUV420P;
