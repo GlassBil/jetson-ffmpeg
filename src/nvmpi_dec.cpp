@@ -56,6 +56,7 @@ struct nvmpictx
 	
 	int frame_pool_size{12};
 	NVMPI_bufPool<NVMPI_frameBuf*>* framePool;
+	NVMPI_frameBuf* heldFrameBuf{nullptr};    // Previous frame's buffer, held until next get_frame
 	
 	//output frame size params
 	unsigned int num_planes;
@@ -762,13 +763,18 @@ int nvmpi_decoder_get_frame(nvmpictx* ctx,nvFrame* frame,bool wait)
 	int ret;
 	NVMPI_frameBuf* fb = ctx->framePool->dqFilledBuf();
 	if(!fb) return -1;
-	
+
 	ret = copyNvBufToFrame(ctx, fb, frame);
 	frame->timestamp=fb->timestamp;
-	
-	//return buffer to pool
-	ctx->framePool->qEmptyBuf(fb);
-	
+
+	// Return the PREVIOUS frame's buffer to the pool now that a new frame has
+	// been dequeued. With CUDA buffers, avFrame->data[] points directly into the
+	// buffer's device memory, so the buffer must stay alive until the consumer
+	// has finished reading (i.e. until the next get_frame call at the earliest).
+	if (ctx->heldFrameBuf)
+		ctx->framePool->qEmptyBuf(ctx->heldFrameBuf);
+	ctx->heldFrameBuf = fb;
+
 	return ret;
 }
 
@@ -780,7 +786,14 @@ int nvmpi_decoder_close(nvmpictx* ctx)
 	{
 		ctx->dec_capture_loop.join();
 	}
-	
+
+	// Return held buffer before destroying the pool
+	if (ctx->heldFrameBuf)
+	{
+		ctx->framePool->qEmptyBuf(ctx->heldFrameBuf);
+		ctx->heldFrameBuf = nullptr;
+	}
+
 	//deinit DstDmaBuffer and DecoderCapturePlane
 	ctx->deinitDecoderCapturePlane();
 	//empty frame queue and free buffers
