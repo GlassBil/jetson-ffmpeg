@@ -15,7 +15,7 @@
 #include <cuda_runtime.h>
 #endif
 
-#define CHUNK_SIZE 4000000
+#define DEFAULT_CHUNK_SIZE 10000000
 #define MAX_BUFFERS 32
 
 #define TEST_ERROR(condition, message, errorCode)    \
@@ -36,7 +36,8 @@ struct nvmpictx
 	unsigned int output_width{0};
 	unsigned int output_height{0};
 	nvSize resized{0, 0};
-	
+	unsigned int chunk_size{DEFAULT_CHUNK_SIZE};
+
 	int numberCaptureBuffers{0};
 	
 	int dmaBufferFileDescriptor[MAX_BUFFERS];
@@ -145,6 +146,11 @@ void nvmpictx::initDecoderCapturePlane(v4l2_format &format)
 
 	/* Request (min + extra) buffers, export and map buffers. */
 	numberCaptureBuffers = minimumDecoderCaptureBuffers + 5;
+	if (numberCaptureBuffers > MAX_BUFFERS)
+	{
+		std::cout << "Clamping capture buffers from " << numberCaptureBuffers << " to " << MAX_BUFFERS << std::endl;
+		numberCaptureBuffers = MAX_BUFFERS;
+	}
 
 	cParams.colorFormat = getNvColorFormatFromV4l2Format(format);
 	cParams.width = coded_width;
@@ -565,7 +571,8 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 	TEST_ERROR(ret < 0, "Could not subscribe to V4L2_EVENT_RESOLUTION_CHANGE", ret);
 	
 	ctx->frame_pool_size = param->frame_pool_size;
-	
+	ctx->chunk_size = param->chunk_size > 0 ? param->chunk_size : DEFAULT_CHUNK_SIZE;
+
 	switch(param->codingType)
 	{
 		case NV_VIDEO_CodingH264:
@@ -591,7 +598,7 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 			break;
 	}
 
-	ret=ctx->dec->setOutputPlaneFormat(ctx->decoder_pixfmt, CHUNK_SIZE);
+	ret=ctx->dec->setOutputPlaneFormat(ctx->decoder_pixfmt, ctx->chunk_size);
 
 	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
 
@@ -649,6 +656,13 @@ int nvmpi_decoder_put_packet(nvmpictx* ctx,nvPacket* packet)
 		}
 	}
 
+	if (packet->payload_size > ctx->chunk_size)
+	{
+		std::cout << "Packet size (" << packet->payload_size
+			<< ") exceeds buffer capacity (" << ctx->chunk_size
+			<< "). Increase chunk_size." << std::endl;
+		return -1;
+	}
 	memcpy(nvBuffer->planes[0].data,packet->payload,packet->payload_size);
 	nvBuffer->planes[0].bytesused=packet->payload_size;
 	v4l2_buf.m.planes[0].bytesused = nvBuffer->planes[0].bytesused;

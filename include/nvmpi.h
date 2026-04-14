@@ -57,6 +57,7 @@ typedef struct _NVDECPARAM{
 	nvCodingType codingType;
 	nvPixFormat pixFormat;
 	nvSize resized;
+	unsigned int chunk_size; /* Max input packet size in bytes. 0 = default (10 MB). */
 } nvDecParam;
 
 typedef struct _NVPACKET{
