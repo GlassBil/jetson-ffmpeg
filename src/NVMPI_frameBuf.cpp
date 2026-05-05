@@ -117,11 +117,19 @@ bool NVMPI_frameBuf::alloc(NvBufferCreateParams& input_params)
 
 bool NVMPI_frameBuf::destroy()
 {
-#ifdef WITH_CUDA_BUFFERS
 	bool success = true;
 
-	if(egl_resource) cudaGraphicsUnregisterResource(egl_resource);
-	if(dst_dma_surface->surfaceList[0].mappedAddr.eglImage) NvBufSurfaceUnMapEglImage(dst_dma_surface, 0);
+#ifdef WITH_CUDA_BUFFERS
+	if(egl_resource)
+	{
+		cudaGraphicsUnregisterResource(egl_resource);
+		egl_resource = nullptr;
+	}
+	if(dst_dma_surface && dst_dma_surface->surfaceList[0].mappedAddr.eglImage)
+	{
+		NvBufSurfaceUnMapEglImage(dst_dma_surface, 0);
+		dst_dma_surface->surfaceList[0].mappedAddr.eglImage = nullptr;
+	}
 
 	for(int i = 0; i < 3; i++)
 	{

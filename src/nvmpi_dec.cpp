@@ -795,6 +795,15 @@ int nvmpi_decoder_get_frame(nvmpictx* ctx,nvFrame* frame,bool wait)
 int nvmpi_decoder_close(nvmpictx* ctx)
 {
 	ctx->eos=true;
+
+	// STREAMOFF both planes before joining the capture-loop thread so V4L2
+	// drops its references on every queued buffer before we tear them down.
+	// The output plane was set up with V4L2_MEMORY_USERPTR in create; without
+	// an explicit STREAMOFF + REQBUFS(0) on it, ~NvVideoDecoder closes the
+	// device fd while the driver still holds buffer reservations, leaving
+	// NvMM-Lite slot state behind. Symptom of the leak: cumulative decoder
+	// degradation across repeated create/close cycles in multi-stream apps.
+	ctx->dec->output_plane.setStreamStatus(false);
 	ctx->dec->capture_plane.setStreamStatus(false);
 	if (ctx->dec_capture_loop.joinable())
 	{
@@ -808,11 +817,18 @@ int nvmpi_decoder_close(nvmpictx* ctx)
 		ctx->heldFrameBuf = nullptr;
 	}
 
+	// REQBUFS(0) on the output plane so the driver releases the USERPTR
+	// reservations it holds. Capture plane is handled by deinitDecoderCapturePlane.
+	ctx->dec->output_plane.deinitPlane();
 	//deinit DstDmaBuffer and DecoderCapturePlane
 	ctx->deinitDecoderCapturePlane();
 	//empty frame queue and free buffers
 	ctx->deinitFramePool();
-	
+
+	// framePool was heap-allocated in create; deinitFramePool only empties
+	// its queues, so without this delete the pool object itself leaks per cycle.
+	delete ctx->framePool; ctx->framePool = nullptr;
+
 	delete ctx->dec; ctx->dec = nullptr;
 
 	delete ctx;
