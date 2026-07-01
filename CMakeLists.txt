@@ -99,15 +99,14 @@ else ()
 	message(STATUS "Using NvBufUtils API.")
 endif()
 
-if(CUDA_BUFFERS)
+if(CUDA_BUFFER)
 	if(NOT EXISTS "${JETSON_MULTIMEDIA_API_INCLUDE_DIR}/nvbufsurface.h")
 		message(FATAL_ERROR "CUDA_BUFFERS only work with NvUtils")
 	endif()
 
 	add_definitions(-DWITH_CUDA_BUFFERS)
 	find_package(CUDAToolkit REQUIRED)
-	set(NVMPI_INCLUDE_DIRS ${NVMPI_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS})
-	set(NVMPI_DEP_LIBS ${NVMPI_DEP_LIBS} CUDA::cudart ${CUDA_LIBRARIES})
+	set(NVMPI_DEP_LIBS ${NVMPI_DEP_LIBS} CUDA::cudart)
 	message(STATUS "Using CUDA buffers")
 endif()
 
