@@ -593,6 +593,49 @@ int copyFrameToNvBuf(nvFrame* frame, NvBuffer& buffer)
 	return 0;
 }
 
+#ifdef WITH_CUDA_BUFFERS
+int copyFrameToNvBufCuda(nvmpictx* ctx, nvFrame* frame, uint32_t bufIndex)
+{
+	cudaEglFrame &eglFrame = ctx->egl_frame[bufIndex];
+
+	// Detect whether the caller's buffers live in device or host memory.
+	// Device/managed -> D2D; unregistered host (e.g. the extradata dummy
+	// frame allocated with av_image_alloc) -> H2D.
+	enum cudaMemcpyKind kind = cudaMemcpyHostToDevice;
+	cudaPointerAttributes attr;
+	cudaError_t st = cudaPointerGetAttributes(&attr, frame->payload[0]);
+	if (st == cudaSuccess && (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged))
+	{
+		kind = cudaMemcpyDeviceToDevice;
+	}
+	else
+	{
+		cudaGetLastError(); // clear the error left by an unregistered host pointer
+	}
+
+	// YUV420P: plane 0 = luma (full w/h), planes 1,2 = chroma (half w/h)
+	for (int plane = 0; plane < 3; plane++)
+	{
+		void *dst = eglFrame.frame.pPitch[plane].ptr;
+		size_t dstPitch = eglFrame.frame.pPitch[plane].pitch;
+		void *src = frame->payload[plane];
+		size_t srcPitch = frame->linesize[plane];
+		size_t widthBytes = (plane == 0) ? ctx->width : ctx->width / 2;
+		size_t height = (plane == 0) ? ctx->height : ctx->height / 2;
+
+		cudaError_t cuda_status = cudaMemcpy2D(dst, dstPitch, src, srcPitch, widthBytes, height, kind);
+		if (cuda_status != cudaSuccess)
+		{
+			cerr << "CUDA memcpy failed for plane " << plane << ": " << cudaGetErrorString(cuda_status) << endl;
+			return -1;
+		}
+	}
+
+	NvBufSurfaceSyncForDevice(ctx->out_surf[bufIndex], 0, -1);
+	return 0;
+}
+#endif
+
 int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 {
 	if(ctx->flushing) return -2;
@@ -643,7 +686,11 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 	
 	if(frame)
 	{
+#ifdef WITH_CUDA_BUFFERS
+		copyFrameToNvBufCuda(ctx, frame, v4l2_buf.index);
+#else
 		copyFrameToNvBuf(frame, *nvBuffer);
+#endif
 		v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
 		v4l2_buf.timestamp.tv_usec = frame->timestamp % 1000000;
 		v4l2_buf.timestamp.tv_sec = frame->timestamp / 1000000;
