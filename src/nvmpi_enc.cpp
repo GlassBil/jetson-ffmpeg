@@ -201,6 +201,49 @@ static int setup_output_dmabuf(nvmpictx *ctx, uint32_t num_buffers )
             return ret;
         }
         ctx->output_plane_fd[i]=fd;
+#ifdef WITH_CUDA_BUFFERS
+        {
+            NvBufSurface *surf = nullptr;
+            if (NvBufSurfaceFromFd(fd, (void**)&surf) != 0)
+            {
+                cerr << "NvBufSurfaceFromFd failed for output buffer " << i << endl;
+                return -1;
+            }
+            ctx->out_surf[i] = surf;
+
+            cudaSetDevice(0);
+            if (surf->surfaceList[0].mappedAddr.eglImage == NULL)
+            {
+                if (NvBufSurfaceMapEglImage(surf, 0) != 0)
+                {
+                    cerr << "Unable to map EGL Image for output buffer " << i << endl;
+                    return -1;
+                }
+            }
+
+            EGLImageKHR egl_image = surf->surfaceList[0].mappedAddr.eglImage;
+            if (egl_image == nullptr)
+            {
+                cerr << "Null EGLImage for output buffer " << i << endl;
+                return -1;
+            }
+
+            cudaFree(0); // ensure a CUDA context exists on this thread
+            cudaError_t cuda_status = cudaGraphicsEGLRegisterImage(&ctx->egl_resource[i], egl_image, cudaGraphicsRegisterFlagsNone);
+            if (cuda_status != cudaSuccess)
+            {
+                cerr << "cudaGraphicsEGLRegisterImage failed for output buffer " << i << ": " << cudaGetErrorName(cuda_status) << endl;
+                return -1;
+            }
+
+            cuda_status = cudaGraphicsResourceGetMappedEglFrame(&ctx->egl_frame[i], ctx->egl_resource[i], 0, 0);
+            if (cuda_status != cudaSuccess)
+            {
+                cerr << "cudaGraphicsResourceGetMappedEglFrame failed for output buffer " << i << ": " << cudaGetErrorName(cuda_status) << endl;
+                return -1;
+            }
+        }
+#endif
     }
     return ret;
 }
@@ -703,6 +746,21 @@ int nvmpi_encoder_close(nvmpictx* ctx)
 	int ret;
     if(ctx->enc)
     {
+#ifdef WITH_CUDA_BUFFERS
+        for (uint32_t i = 0; i < ctx->enc->output_plane.getNumBuffers(); i++)
+        {
+            if (ctx->egl_resource[i])
+            {
+                cudaGraphicsUnregisterResource(ctx->egl_resource[i]);
+                ctx->egl_resource[i] = nullptr;
+            }
+            if (ctx->out_surf[i] && ctx->out_surf[i]->surfaceList[0].mappedAddr.eglImage)
+            {
+                NvBufSurfaceUnMapEglImage(ctx->out_surf[i], 0);
+            }
+            ctx->out_surf[i] = nullptr;
+        }
+#endif
         for (uint32_t i = 0; i < ctx->enc->output_plane.getNumBuffers(); i++)
         {
             // Unmap output plane buffer for memory type DMABUF.
