@@ -9,6 +9,11 @@
 #include <thread>
 #include <unistd.h>
 
+#ifdef WITH_CUDA_BUFFERS
+#include <cuda_egl_interop.h>
+#include <cuda_runtime.h>
+#endif
+
 #define MAX_BUFFERS 32
 #define TEST_ERROR(condition, message, errorCode)    \
 	if (condition)                               \
@@ -18,7 +23,11 @@
 
 #define OUTPLANE_MEMTYPE_MMAP 0
 #define OUTPLANE_MEMTYPE_DMA 1
+#ifdef WITH_CUDA_BUFFERS
+#define OUTPLANE_MEMTYPE OUTPLANE_MEMTYPE_DMA
+#else
 #define OUTPLANE_MEMTYPE OUTPLANE_MEMTYPE_MMAP
+#endif
 
 using namespace std;
 
@@ -58,6 +67,11 @@ struct nvmpictx
 	NvVideoEncoder *enc;
 	NVMPI_bufPool<nvPacket*>* pktPool;
 	int *output_plane_fd; //array to store dmabuf fd's
+#ifdef WITH_CUDA_BUFFERS
+	cudaEglFrame egl_frame[MAX_BUFFERS];
+	cudaGraphicsResource_t egl_resource[MAX_BUFFERS];
+	NvBufSurface* out_surf[MAX_BUFFERS];
+#endif
 };
 
 
@@ -213,6 +227,13 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ctx->packets_num=param->capture_num;
 #if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_DMA)
 	ctx->output_plane_fd = new int[ctx->packets_num];
+#endif
+#ifdef WITH_CUDA_BUFFERS
+	for(int i = 0; i < MAX_BUFFERS; i++)
+	{
+		ctx->egl_resource[i] = nullptr;
+		ctx->out_surf[i] = nullptr;
+	}
 #endif
 	ctx->qmax=param->qmax;
 	ctx->qmin=param->qmin;
