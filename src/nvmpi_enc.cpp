@@ -613,15 +613,21 @@ int copyFrameToNvBufCuda(nvmpictx* ctx, nvFrame* frame, uint32_t bufIndex)
 		cudaGetLastError(); // clear the error left by an unregistered host pointer
 	}
 
-	// YUV420P: plane 0 = luma (full w/h), planes 1,2 = chroma (half w/h)
-	for (int plane = 0; plane < 3; plane++)
+	// Drive the copy from the surface's own plane geometry rather than assuming a tightly-packed
+	// 3-plane YUV420 layout. The destination pitch must be the surface pitch (what the encoder
+	// reads), which is alignment-padded and not the tightly-packed width; the plane count, per-plane
+	// row-byte count and height also come from the surface. This mirrors how the decoder reads these
+	// buffers (see nvmpi_dec.cpp) and avoids the sheared/striped output and unwritten trailing rows a
+	// pitch/height mismatch produces.
+	NvBufSurfacePlaneParams &parm = ctx->out_surf[bufIndex]->surfaceList[0].planeParams;
+	for (uint32_t plane = 0; plane < parm.num_planes; plane++)
 	{
 		void *dst = eglFrame.frame.pPitch[plane].ptr;
-		size_t dstPitch = eglFrame.frame.pPitch[plane].pitch;
+		size_t dstPitch = parm.pitch[plane];
 		void *src = frame->payload[plane];
 		size_t srcPitch = frame->linesize[plane];
-		size_t widthBytes = (plane == 0) ? ctx->width : ctx->width / 2;
-		size_t height = (plane == 0) ? ctx->height : ctx->height / 2;
+		size_t widthBytes = parm.width[plane] * parm.bytesPerPix[plane];
+		size_t height = parm.height[plane];
 
 		cudaError_t cuda_status = cudaMemcpy2D(dst, dstPitch, src, srcPitch, widthBytes, height, kind);
 		if (cuda_status != cudaSuccess)
