@@ -688,6 +688,13 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 	{
 #ifdef WITH_CUDA_BUFFERS
 		copyFrameToNvBufCuda(ctx, frame, v4l2_buf.index);
+		// copyFrameToNvBufCuda writes the EGL-mapped surface but not the NvBuffer plane sizes.
+		// The DMABUF qBuffer below takes bytesused from nvBuffer->planes[].bytesused, and a
+		// zero there is the encoder's EOS marker, so it must carry the real frame size.
+		for (uint32_t j = 0; j < nvBuffer->n_planes; j++)
+		{
+			nvBuffer->planes[j].bytesused = nvBuffer->planes[j].fmt.stride * nvBuffer->planes[j].fmt.height;
+		}
 #else
 		copyFrameToNvBuf(frame, *nvBuffer);
 #endif
@@ -701,6 +708,14 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame)
 		ctx->flushing = true;
 		v4l2_buf.m.planes[0].m.userptr = 0;
 		v4l2_buf.m.planes[0].bytesused = v4l2_buf.m.planes[1].bytesused = v4l2_buf.m.planes[2].bytesused = 0;
+#if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_DMA)
+		// The DMABUF bytesused copy below sources from nvBuffer->planes[]; a stale non-zero size left
+		// by the previous frame would mask this EOS marker, so clear it on the buffer object too.
+		for (uint32_t j = 0; j < nvBuffer->n_planes; j++)
+		{
+			nvBuffer->planes[j].bytesused = 0;
+		}
+#endif
 	}
 
 	//needed for V4L2_MEMORY_MMAP and V4L2_MEMORY_DMABUF
