@@ -121,6 +121,14 @@ set_target_properties(nvmpi PROPERTIES LINK_FLAGS "-Wl,--no-as-needed")
 target_link_libraries(nvmpi PRIVATE ${NVMPI_DEP_LIBS})
 target_include_directories(nvmpi PRIVATE ${NVMPI_INCLUDE_DIRS})
 target_include_directories(nvmpi_static PRIVATE ${NVMPI_INCLUDE_DIRS})
+
+option(BUILD_ENC_LEAK_SOAK "Build the on-device encoder create/destroy soak harness. Default: OFF." OFF)
+if(BUILD_ENC_LEAK_SOAK)
+	add_executable(enc_leak_soak tools/enc_leak_soak.cpp)
+	target_include_directories(enc_leak_soak PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${NVMPI_INCLUDE_DIRS})
+	target_link_libraries(enc_leak_soak nvmpi)
+endif()
+
 configure_file(nvmpi.pc.in nvmpi.pc @ONLY)
 include(GNUInstallDirs)
 install(TARGETS nvmpi nvmpi_static
