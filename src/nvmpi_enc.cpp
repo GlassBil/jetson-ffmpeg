@@ -59,6 +59,7 @@ struct nvmpictx
 	bool blocking_mode;
 	bool capPlaneGotEOS;
 	bool flushing;
+	bool dqThreadStarted;
 
 	enum v4l2_mpeg_video_bitrate_mode ratecontrol;
 	enum v4l2_mpeg_video_h264_level level;
@@ -73,6 +74,10 @@ struct nvmpictx
 	NvBufSurface* out_surf[MAX_BUFFERS];
 #endif
 };
+
+// Frees every resource nvmpi_create_encoder allocates; safe on a partially-built context.
+// Forward-declared here because create's failure paths call it (it is defined near close()).
+static void destroy_encoder_context(nvmpictx* ctx);
 
 
 static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBuffer * buffer, NvBuffer * shared_buffer __attribute__((unused)), void *arg)
@@ -270,6 +275,10 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ctx->packets_num=param->capture_num;
 #if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_DMA)
 	ctx->output_plane_fd = new int[ctx->packets_num];
+	for(uint32_t i = 0; i < ctx->packets_num; i++)
+	{
+		ctx->output_plane_fd[i] = -1;
+	}
 #endif
 #ifdef WITH_CUDA_BUFFERS
 	for(int i = 0; i < MAX_BUFFERS; i++)
@@ -285,6 +294,7 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	ctx->insert_sps_pps_at_idr=(param->insert_spspps_idr==1)?true:false;
 	ctx->capPlaneGotEOS = false;
 	ctx->flushing = false;
+	ctx->dqThreadStarted = false;
 	ctx->blocking_mode = true; //TODO non-blocking mode support
 	ctx->max_perf = true; //TODO invistigate why encoder is slow without max_perf even with MAXN power mode
 	ctx->vbv_buffer_size = param->vbv_buffer_size;
@@ -398,11 +408,21 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	{
 		ctx->enc = NvVideoEncoder::createVideoEncoder("enc0", O_NONBLOCK);
 	}
-	TEST_ERROR(!ctx->enc, "Could not create encoder",ret);
+	if(!ctx->enc)
+	{
+		cerr << "Could not create encoder" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	ret = ctx->enc->setCapturePlaneFormat(ctx->encoder_pixfmt, ctx->width,ctx->height, NVMPI_ENC_CHUNK_SIZE);
 
-	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
+	if(ret < 0)
+	{
+		cerr << "Could not set capture plane format" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	switch (ctx->profile)
 	{
@@ -424,7 +444,12 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		ret = ctx->enc->setOutputPlaneFormat(ctx->raw_pixfmt, ctx->width,ctx->height);
 	}
 
-	TEST_ERROR(ret < 0, "Could not set output plane format", ret);
+	if(ret < 0)
+	{
+		cerr << "Could not set output plane format" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	ret = ctx->enc->setBitrate(ctx->bitrate);
 	TEST_ERROR(ret < 0, "Could not set encoder bitrate", ret);
@@ -520,24 +545,50 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 #else
 	ret = setup_output_dmabuf(ctx,ctx->packets_num); //V4L2_MEMORY_DMABUF
 #endif
-	TEST_ERROR(ret < 0, "Could not setup output plane", ret);
+	if(ret < 0)
+	{
+		cerr << "Could not setup output plane" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	ret = ctx->enc->capture_plane.setupPlane(V4L2_MEMORY_MMAP, ctx->packets_num, true, false);
-	TEST_ERROR(ret < 0, "Could not setup capture plane", ret);
+	if(ret < 0)
+	{
+		cerr << "Could not setup capture plane" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	ret = ctx->enc->subscribeEvent(V4L2_EVENT_EOS,0,0);
-	TEST_ERROR(ret < 0, "Could not subscribe EOS event", ret);
+	if(ret < 0)
+	{
+		cerr << "Could not subscribe EOS event" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	ret = ctx->enc->output_plane.setStreamStatus(true);
-	TEST_ERROR(ret < 0, "Error in output plane streamon", ret);
+	if(ret < 0)
+	{
+		cerr << "Error in output plane streamon" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	ret = ctx->enc->capture_plane.setStreamStatus(true);
-	TEST_ERROR(ret < 0, "Error in capture plane streamon", ret);
+	if(ret < 0)
+	{
+		cerr << "Error in capture plane streamon" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
+	}
 
 	if(ctx->blocking_mode)
 	{
 		ctx->enc->capture_plane.setDQThreadCallback(encoder_capture_plane_dq_callback);
 		ctx->enc->capture_plane.startDQThread(ctx);
+		ctx->dqThreadStarted = true;
 	}
     else
     {
@@ -562,7 +613,12 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 		v4l2_buf.m.planes = planes;
 
 		ret = ctx->enc->capture_plane.qBuffer(v4l2_buf, NULL);
-		TEST_ERROR(ret < 0, "Error while queueing buffer at capture plane", ret);
+		if(ret < 0)
+		{
+			cerr << "Error while queueing buffer at capture plane" << endl;
+			destroy_encoder_context(ctx);
+			return nullptr;
+		}
 
 	}
 
@@ -797,62 +853,72 @@ int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket** packet)
 	return 0;
 }
 
-int nvmpi_encoder_close(nvmpictx* ctx)
+// Free every resource nvmpi_create_encoder allocates. Safe on a fully- or partially-built
+// context: each resource is null/-1 guarded, the cleanup is driven off the packets_num-sized
+// arrays (not output_plane.getNumBuffers(), which may be 0 on a partial build), it never
+// early-returns, and it deletes ctx last. Called by nvmpi_encoder_close and by every
+// nvmpi_create_encoder failure path.
+static void destroy_encoder_context(nvmpictx* ctx)
 {
-	if(ctx->blocking_mode)
+	if(!ctx)
 	{
-		ctx->enc->capture_plane.stopDQThread();
-		ctx->enc->capture_plane.waitForDQThread(1000);
+		return;
 	}
-	else
-	{
-		//sem_destroy(&ctx.pollthread_sema);
-		//sem_destroy(&ctx.encoderthread_sema);
-	}
-	
-#if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_DMA)	
-	int ret;
-    if(ctx->enc)
-    {
-#ifdef WITH_CUDA_BUFFERS
-        for (uint32_t i = 0; i < ctx->enc->output_plane.getNumBuffers(); i++)
-        {
-            if (ctx->egl_resource[i])
-            {
-                cudaGraphicsUnregisterResource(ctx->egl_resource[i]);
-                ctx->egl_resource[i] = nullptr;
-            }
-            if (ctx->out_surf[i] && ctx->out_surf[i]->surfaceList[0].mappedAddr.eglImage)
-            {
-                NvBufSurfaceUnMapEglImage(ctx->out_surf[i], 0);
-            }
-            ctx->out_surf[i] = nullptr;
-        }
-#endif
-        for (uint32_t i = 0; i < ctx->enc->output_plane.getNumBuffers(); i++)
-        {
-            // Unmap output plane buffer for memory type DMABUF.
-            ret = ctx->enc->output_plane.unmapOutputBuffers(i, ctx->output_plane_fd[i]);
-            if (ret < 0)
-            {
-                cerr << "Error while unmapping buffer at output plane" << endl;
-            }
 
-            ret = NvBufSurf::NvDestroy(ctx->output_plane_fd[i]);
-            ctx->output_plane_fd[i] = -1;
-            if(ret < 0)
-            {
-                cerr << "Failed to Destroy NvBuffer\n" << endl;
-                return ret;
-            }
-        }
-    }
-    delete[] ctx->output_plane_fd;
-    #endif
-	
+	// Stop the capture DQ thread before freeing anything it might touch. abort() unblocks a
+	// thread parked in a blocking dqBuffer so the join cannot time out and race delete enc.
+	if(ctx->enc && ctx->dqThreadStarted && ctx->blocking_mode)
+	{
+		ctx->enc->abort();
+		ctx->enc->capture_plane.stopDQThread();
+		ctx->enc->capture_plane.waitForDQThread(-1);
+		ctx->dqThreadStarted = false;
+	}
+
+#if (OUTPLANE_MEMTYPE == OUTPLANE_MEMTYPE_DMA)
+	if(ctx->output_plane_fd)
+	{
+		for(uint32_t i = 0; i < ctx->packets_num; i++)
+		{
+#ifdef WITH_CUDA_BUFFERS
+			if(ctx->egl_resource[i])
+			{
+				cudaGraphicsUnregisterResource(ctx->egl_resource[i]);
+				ctx->egl_resource[i] = nullptr;
+			}
+
+			if(ctx->out_surf[i] && ctx->out_surf[i]->surfaceList[0].mappedAddr.eglImage)
+			{
+				NvBufSurfaceUnMapEglImage(ctx->out_surf[i], 0);
+			}
+
+			ctx->out_surf[i] = nullptr;
+#endif
+			if(ctx->output_plane_fd[i] != -1)
+			{
+				if(ctx->enc)
+				{
+					ctx->enc->output_plane.unmapOutputBuffers(i, ctx->output_plane_fd[i]);
+				}
+
+				NvBufSurf::NvDestroy(ctx->output_plane_fd[i]);
+				ctx->output_plane_fd[i] = -1;
+			}
+		}
+
+		delete[] ctx->output_plane_fd;
+		ctx->output_plane_fd = nullptr;
+	}
+#endif
+
 	delete ctx->enc;
 	delete ctx->pktPool;
 	delete ctx;
+}
+
+int nvmpi_encoder_close(nvmpictx* ctx)
+{
+	destroy_encoder_context(ctx);
 	return 0;
 }
 

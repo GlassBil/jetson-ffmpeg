@@ -92,6 +92,8 @@ extern "C" {
 
 	int nvmpi_decoder_close(nvmpictx* ctx);
 
+	// Returns NULL on failure (any allocation/setup error); the partial context is freed
+	// internally, so callers must null-check and must not call nvmpi_encoder_close on NULL.
 	nvmpictx* nvmpi_create_encoder(nvEncParam* param);
 	//add frame to encoder
 	int nvmpi_encoder_put_frame(nvmpictx* ctx, nvFrame* frame);
