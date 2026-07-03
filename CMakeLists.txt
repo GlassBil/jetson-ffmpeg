@@ -129,6 +129,16 @@ if(BUILD_ENC_LEAK_SOAK)
 	target_link_libraries(enc_leak_soak nvmpi)
 endif()
 
+option(BUILD_ENC_TEAR_SOAK "Build the on-device encoder input-tear repro harness. Default: OFF." OFF)
+if(BUILD_ENC_TEAR_SOAK)
+	add_executable(enc_tear_soak tools/enc_tear_soak.cpp)
+	target_include_directories(enc_tear_soak PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${NVMPI_INCLUDE_DIRS})
+	target_link_libraries(enc_tear_soak nvmpi Threads::Threads)
+	if(CUDA_BUFFERS)
+		target_link_libraries(enc_tear_soak CUDA::cudart)
+	endif()
+endif()
+
 configure_file(nvmpi.pc.in nvmpi.pc @ONLY)
 include(GNUInstallDirs)
 install(TARGETS nvmpi nvmpi_static
