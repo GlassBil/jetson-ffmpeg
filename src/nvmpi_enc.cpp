@@ -693,6 +693,20 @@ int copyFrameToNvBufCuda(nvmpictx* ctx, nvFrame* frame, uint32_t bufIndex)
 		}
 	}
 
+	// cudaMemcpy2D can return before the copy has landed in the destination: for pageable host
+	// sources it returns once the source is staged for DMA, and device sources are asynchronous
+	// outright. The caller qBuffers this surface straight to the hardware encoder, which reads it
+	// outside any CUDA stream ordering, so without an explicit synchronize here the encoder can
+	// read a half-written surface — intermittent macroblock tearing and missing (green) chroma,
+	// worst on the last frames of a stream where no follow-up memcpy forces completion.
+	// Repro + regression check: tools/enc_tear_soak.cpp with tools/enc_tear_check.py.
+	cudaError_t sync_status = cudaStreamSynchronize(0);
+	if (sync_status != cudaSuccess)
+	{
+		cerr << "cudaStreamSynchronize failed: " << cudaGetErrorString(sync_status) << endl;
+		return -1;
+	}
+
 	NvBufSurfaceSyncForDevice(ctx->out_surf[bufIndex], 0, -1);
 	return 0;
 }
