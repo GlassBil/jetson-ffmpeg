@@ -205,8 +205,14 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		av_image_alloc(dst, linesize,avctx->width,avctx->height,avctx->pix_fmt,1);
 
 		nvmpi_context->ctx = nvmpi_create_encoder(&param);
+		if(!nvmpi_context->ctx)
+		{
+			av_freep(&dst[0]);
+			av_frame_free(&nvmpi_context->frame);
+			return AVERROR(EINVAL);
+		}
+
 		_ctx = nvmpi_context->ctx;
-		//TODO error handling. if(!_ctx)
 		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
 		i=0;
 		_nvframe.timestamp=0;
@@ -299,12 +305,14 @@ static av_cold int nvmpi_encode_init(AVCodecContext *avctx)
 		nvmpi_context->ctx=nvmpi_create_encoder(&param);
 	}
 	//else TODO
-	
-	if(nvmpi_context->ctx)
+
+	if(!nvmpi_context->ctx)
 	{
-		nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
+		av_frame_free(&nvmpi_context->frame);
+		return AVERROR(EINVAL);
 	}
-	//TODO error handling. if(!nvmpi_context->ctx)
+
+	nvmpienc_initPktPool(avctx,nvmpi_context->packet_pool_size);
 
 	return 0;
 }
