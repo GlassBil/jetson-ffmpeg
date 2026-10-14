@@ -72,6 +72,7 @@ struct nvmpictx
 	cudaEglFrame egl_frame[MAX_BUFFERS];
 	cudaGraphicsResource_t egl_resource[MAX_BUFFERS];
 	NvBufSurface* out_surf[MAX_BUFFERS];
+	cudaStream_t copyStream; // host-source frame copies, so they don't wait for the rest of the process's GPU work
 #endif
 };
 
@@ -285,6 +286,14 @@ nvmpictx* nvmpi_create_encoder(nvEncParam* param)
 	{
 		ctx->egl_resource[i] = nullptr;
 		ctx->out_surf[i] = nullptr;
+	}
+
+	ctx->copyStream = nullptr;
+	if(cudaStreamCreateWithFlags(&ctx->copyStream, cudaStreamNonBlocking) != cudaSuccess)
+	{
+		cerr << "Could not create the CUDA frame copy stream" << endl;
+		destroy_encoder_context(ctx);
+		return nullptr;
 	}
 #endif
 	ctx->qmax=param->qmax;
@@ -676,6 +685,12 @@ int copyFrameToNvBufCuda(nvmpictx* ctx, nvFrame* frame, uint32_t bufIndex)
 	// buffers (see nvmpi_dec.cpp) and avoids the sheared/striped output and unwritten trailing rows a
 	// pitch/height mismatch produces.
 	NvBufSurfacePlaneParams &parm = ctx->out_surf[bufIndex]->surfaceList[0].planeParams;
+
+	// Host sources are fully written before put_frame, so their copies go on the encoder's own stream and don't wait
+	// for the caller's other GPU work (the legacy default stream waits for every blocking stream in the process).
+	// Device sources stay on the legacy default stream, whose implicit ordering waits for the kernel that produced
+	// them.
+	cudaStream_t stream = kind == cudaMemcpyHostToDevice ? ctx->copyStream : 0;
 	for (uint32_t plane = 0; plane < parm.num_planes; plane++)
 	{
 		void *dst = eglFrame.frame.pPitch[plane].ptr;
@@ -685,7 +700,7 @@ int copyFrameToNvBufCuda(nvmpictx* ctx, nvFrame* frame, uint32_t bufIndex)
 		size_t widthBytes = parm.width[plane] * parm.bytesPerPix[plane];
 		size_t height = parm.height[plane];
 
-		cudaError_t cuda_status = cudaMemcpy2D(dst, dstPitch, src, srcPitch, widthBytes, height, kind);
+		cudaError_t cuda_status = cudaMemcpy2DAsync(dst, dstPitch, src, srcPitch, widthBytes, height, kind, stream);
 		if (cuda_status != cudaSuccess)
 		{
 			cerr << "CUDA memcpy failed for plane " << plane << ": " << cudaGetErrorString(cuda_status) << endl;
@@ -693,14 +708,13 @@ int copyFrameToNvBufCuda(nvmpictx* ctx, nvFrame* frame, uint32_t bufIndex)
 		}
 	}
 
-	// cudaMemcpy2D can return before the copy has landed in the destination: for pageable host
-	// sources it returns once the source is staged for DMA, and device sources are asynchronous
-	// outright. The caller qBuffers this surface straight to the hardware encoder, which reads it
-	// outside any CUDA stream ordering, so without an explicit synchronize here the encoder can
-	// read a half-written surface — intermittent macroblock tearing and missing (green) chroma,
-	// worst on the last frames of a stream where no follow-up memcpy forces completion.
+	// The copies return before they have landed in the destination. The caller qBuffers this
+	// surface straight to the hardware encoder, which reads it outside any CUDA stream ordering,
+	// so without an explicit synchronize here the encoder can read a half-written surface —
+	// intermittent macroblock tearing and missing (green) chroma, worst on the last frames of a
+	// stream where no follow-up memcpy forces completion.
 	// Repro + regression check: tools/enc_tear_soak.cpp with tools/enc_tear_check.py.
-	cudaError_t sync_status = cudaStreamSynchronize(0);
+	cudaError_t sync_status = cudaStreamSynchronize(stream);
 	if (sync_status != cudaSuccess)
 	{
 		cerr << "cudaStreamSynchronize failed: " << cudaGetErrorString(sync_status) << endl;
@@ -922,6 +936,14 @@ static void destroy_encoder_context(nvmpictx* ctx)
 
 		delete[] ctx->output_plane_fd;
 		ctx->output_plane_fd = nullptr;
+	}
+#endif
+
+#ifdef WITH_CUDA_BUFFERS
+	if(ctx->copyStream)
+	{
+		cudaStreamDestroy(ctx->copyStream);
+		ctx->copyStream = nullptr;
 	}
 #endif
 

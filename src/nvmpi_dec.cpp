@@ -58,6 +58,12 @@ struct nvmpictx
 	int frame_pool_size{12};
 	NVMPI_bufPool<NVMPI_frameBuf*>* framePool;
 	NVMPI_frameBuf* heldFrameBuf{nullptr};    // Previous frame's buffer, held until next get_frame
+#ifdef WITH_CUDA_BUFFERS
+	// Plane copies run on this stream, not the legacy default stream: a default-stream copy waits for every
+	// blocking stream in the process (the caller's inference) and runs asynchronously, so it could still be
+	// pending when the decoder reuses the source surface.
+	cudaStream_t copyStream{nullptr};
+#endif
 	
 	//output frame size params
 	unsigned int num_planes;
@@ -564,6 +570,15 @@ nvmpictx* nvmpi_create_decoder(nvDecParam* param)
 
 	nvmpictx* ctx=new nvmpictx();
 
+#ifdef WITH_CUDA_BUFFERS
+	if (cudaStreamCreateWithFlags(&ctx->copyStream, cudaStreamNonBlocking) != cudaSuccess)
+	{
+		printf("Could not create the CUDA plane copy stream\n");
+		delete ctx;
+		return nullptr;
+	}
+#endif
+
 	ctx->dec = NvVideoDecoder::createVideoDecoder("dec0");
 	TEST_ERROR(!ctx->dec, "Could not create decoder",ret);
 
@@ -710,8 +725,8 @@ int copyNvBufToFrame(nvmpictx* ctx, NVMPI_frameBuf *nvmpiBuf, nvFrame* frame)
 		size_t cudaDstPitch = nvmpiBuf->cuda_pitch[plane];
 		unsigned int &srcFrameLineSize = ctx->frame_linesize[plane];
 		unsigned int &copySz = ctx->frame_linedatasize[plane];
-		cudaError_t cudaRet = cudaMemcpy2D(cudaDst, cudaDstPitch, dataSrc, srcFrameLineSize, copySz,
-			ctx->frame_height[plane], cudaMemcpyDeviceToDevice);
+		cudaError_t cudaRet = cudaMemcpy2DAsync(cudaDst, cudaDstPitch, dataSrc, srcFrameLineSize, copySz,
+			ctx->frame_height[plane], cudaMemcpyDeviceToDevice, ctx->copyStream);
 		if(cudaRet != cudaSuccess)
 		{
 			printf("CUDA memcpy failed for plane %d: %s\n", plane, cudaGetErrorString(cudaRet));
@@ -721,6 +736,16 @@ int copyNvBufToFrame(nvmpictx* ctx, NVMPI_frameBuf *nvmpiBuf, nvFrame* frame)
 
 		frame->payload[plane] = static_cast<unsigned char*>(cudaDst);
 		frame->linesize[plane] = cudaDstPitch;
+	}
+
+	// The frame must be complete when it is handed out: after the next get_frame the decoder may reuse the source
+	// surface. Only this stream is waited for, not the rest of the process's GPU work.
+	cudaError_t syncRet = cudaStreamSynchronize(ctx->copyStream);
+	if(syncRet != cudaSuccess)
+	{
+		printf("CUDA plane copy failed: %s\n", cudaGetErrorString(syncRet));
+		NvBufSurfaceUnMap(nvbuf_surf, 0, -1);
+		return -1;
 	}
 
 	NvBufSurfaceUnMap(nvbuf_surf, 0, -1);
@@ -830,6 +855,14 @@ int nvmpi_decoder_close(nvmpictx* ctx)
 	delete ctx->framePool; ctx->framePool = nullptr;
 
 	delete ctx->dec; ctx->dec = nullptr;
+
+#ifdef WITH_CUDA_BUFFERS
+	if (ctx->copyStream)
+	{
+		cudaStreamDestroy(ctx->copyStream);
+		ctx->copyStream = nullptr;
+	}
+#endif
 
 	delete ctx;
 

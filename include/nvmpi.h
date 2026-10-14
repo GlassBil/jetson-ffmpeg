@@ -88,6 +88,9 @@ extern "C" {
 
 	int nvmpi_decoder_put_packet(nvmpictx* ctx, nvPacket* packet);
 
+	// With CUDA buffers, frame->payload[] points into decoder-owned device memory that holds the finished frame
+	// when this returns. It is reused for later frames, so finish (synchronize) any read of it before the next
+	// get_frame call.
 	int nvmpi_decoder_get_frame(nvmpictx* ctx, nvFrame* frame,bool wait);
 
 	int nvmpi_decoder_close(nvmpictx* ctx);
