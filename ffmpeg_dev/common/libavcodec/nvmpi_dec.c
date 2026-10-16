@@ -30,6 +30,7 @@ typedef struct {
 	AVFrame *bufFrame;
 	char *resize_expr;
 	int frame_pool_size;
+	AVPacket *packet;
 } nvmpiDecodeContext;
 
 static nvCodingType nvmpi_get_codingtype(AVCodecContext *avctx)
@@ -103,12 +104,21 @@ static int nvmpi_init_decoder(AVCodecContext *avctx)
 		return AVERROR(ENOMEM);
 	}
 
+	nvmpi_context->packet = av_packet_alloc();
+	if (!nvmpi_context->packet)
+	{
+		av_frame_free(&(nvmpi_context->bufFrame));
+		nvmpi_context->bufFrame = NULL;
+		return AVERROR(ENOMEM);
+	}
+
 	nvmpi_context->ctx=nvmpi_create_decoder(&param);
 
 	if(!nvmpi_context->ctx)
 	{
 		av_frame_free(&(nvmpi_context->bufFrame));
 		nvmpi_context->bufFrame = NULL;
+		av_packet_free(&(nvmpi_context->packet));
 		av_log(avctx, AV_LOG_ERROR, "Failed to nvmpi_create_decoder (code = %d).\n", AVERROR_EXTERNAL);
 		return AVERROR_EXTERNAL;
 	}
@@ -124,39 +134,29 @@ static int nvmpi_close(AVCodecContext *avctx)
 		av_frame_free(&(nvmpi_context->bufFrame));
 		nvmpi_context->bufFrame = NULL;
 	}
+	av_packet_free(&(nvmpi_context->packet));
 	return nvmpi_decoder_close(nvmpi_context->ctx);
 }
 
-#if LIBAVCODEC_VERSION_MAJOR >= 60
-static int nvmpi_decode(AVCodecContext *avctx, AVFrame *data, int *got_frame, AVPacket *avpkt)
-#else
-static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPacket *avpkt)
-#endif
+static int nvmpi_put_packet(AVCodecContext *avctx, const AVPacket *avpkt)
 {
 	nvmpiDecodeContext *nvmpi_context = avctx->priv_data;
-	AVFrame *frame = data;
+	nvPacket packet;
+
+	packet.payload_size=avpkt->size;
+	packet.payload=avpkt->data;
+	packet.pts=avpkt->pts;
+
+	return nvmpi_decoder_put_packet(nvmpi_context->ctx,&packet);
+}
+
+// Hands out the oldest decoded frame. Returns AVERROR(EAGAIN) when the decoder has none ready.
+static int nvmpi_output_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+	nvmpiDecodeContext *nvmpi_context = avctx->priv_data;
 	AVFrame *bufFrame = nvmpi_context->bufFrame;
 	nvFrame _nvframe={0};
-	nvPacket packet;
 	int res;
-	int decode_ret = avpkt->size;
-
-	if(avpkt->size)
-	{
-		packet.payload_size=avpkt->size;
-		packet.payload=avpkt->data;
-		packet.pts=avpkt->pts;
-
-		res=nvmpi_decoder_put_packet(nvmpi_context->ctx,&packet);
-		if(res < 0)
-		{
-			if(res == -1)
-			{
-				decode_ret = AVERROR(EAGAIN); //TODO log
-			}
-			//TODO error handling
-		}
-	}
 
 	for (int i = 0; i < 3; ++i)
 	{
@@ -168,7 +168,7 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 
 	if(res<0)
 	{
-		return decode_ret;
+		return AVERROR(EAGAIN);
 	}
 
 	for (int i = 0; i < 3; ++i)
@@ -181,9 +181,7 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 	bufFrame->pts=_nvframe.timestamp;
 	bufFrame->pkt_dts = AV_NOPTS_VALUE;
 	av_frame_move_ref(frame, bufFrame);
-	
-	*got_frame = 1;
-	
+
 	bufFrame->width = avctx->width;
 	bufFrame->height = avctx->height;
 	if (ff_get_buffer(avctx, bufFrame, 0) < 0)
@@ -191,12 +189,78 @@ static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPac
 		av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed\n");
 		return AVERROR(ENOMEM);
 	}
-	
+
 	frame->metadata = bufFrame->metadata;
 	bufFrame->metadata = NULL;
 
+	return 0;
+}
+
+#if LIBAVCODEC_VERSION_MAJOR >= 60
+// Frames the decoder has already finished go out before it takes another packet. Through the decode callback,
+// one packet in could bring at most one frame out, so every frame the decoder ever fell behind by stayed queued
+// until all its buffers were full, adding a constant lag of about 20 frames.
+static int nvmpi_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+	nvmpiDecodeContext *nvmpi_context = avctx->priv_data;
+	int res;
+
+	res = nvmpi_output_frame(avctx, frame);
+	if (res != AVERROR(EAGAIN))
+	{
+		return res;
+	}
+
+	res = ff_decode_get_packet(avctx, nvmpi_context->packet);
+	if (res < 0)
+	{
+		return res;
+	}
+
+	if (nvmpi_context->packet->size)
+	{
+		nvmpi_put_packet(avctx, nvmpi_context->packet); //TODO error handling
+	}
+
+	av_packet_unref(nvmpi_context->packet);
+
+	return nvmpi_output_frame(avctx, frame);
+}
+#else
+static int nvmpi_decode(AVCodecContext *avctx, void *data, int *got_frame, AVPacket *avpkt)
+{
+	int res;
+	int decode_ret = avpkt->size;
+
+	if(avpkt->size)
+	{
+		res=nvmpi_put_packet(avctx, avpkt);
+		if(res < 0)
+		{
+			if(res == -1)
+			{
+				decode_ret = AVERROR(EAGAIN); //TODO log
+			}
+			//TODO error handling
+		}
+	}
+
+	res = nvmpi_output_frame(avctx, data);
+	if (res == AVERROR(EAGAIN))
+	{
+		return decode_ret;
+	}
+
+	if (res < 0)
+	{
+		return res;
+	}
+
+	*got_frame = 1;
+
 	return decode_ret;
 }
+#endif
 
 
 
@@ -226,7 +290,7 @@ static const AVOption options[] = {
 			.priv_data_size = sizeof(nvmpiDecodeContext), \
 			.init           = nvmpi_init_decoder, \
 			.close          = nvmpi_close, \
-			FF_CODEC_DECODE_CB(nvmpi_decode), \
+			FF_CODEC_RECEIVE_FRAME_CB(nvmpi_receive_frame), \
 			.p.priv_class     = &nvmpi_##NAME##_dec_class, \
 			.p.capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AVOID_PROBING | AV_CODEC_CAP_HARDWARE, \
 			.p.pix_fmts	=(const enum AVPixelFormat[]){AV_PIX_FMT_YUV420P,AV_PIX_FMT_NV12,AV_PIX_FMT_NONE},\
